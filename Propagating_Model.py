@@ -6,6 +6,7 @@ from scipy.integrate import solve_ivp
 import os
 import math
 import warnings
+import time
 
 # Reproducibility
 rng = np.random.default_rng(0)
@@ -70,13 +71,17 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
         'dim_y': int
         'dim_theta': int
     Returns:
-        results dict with times, mean and std (component-wise) for quadrature (SP) and MC reference.
+        results dict with times, mean and std (component-wise) for quadrature (SP) and MC reference,
+        plus runtime info.
     """
     name = system['name']
     ode_fun = system['ode_fun']
     theta_to_setup = system['theta_to_setup']
     dim_y = system['dim_y']
     dim_theta = system['dim_theta']
+
+    #Probabilistic numerics
+    t0_sp = time.perf_counter()
 
     #Sigma points
     nodes, w = spherical_cubature(theta_mean, theta_cov)
@@ -97,7 +102,12 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
     sp_var = np.tensordot(w, diffs**2, axes=(0,0))   # shape (dim_y, M)
     sp_std = np.sqrt(sp_var)
 
-    # Monte Carlo reference
+    t1_sp = time.perf_counter()
+    sp_time = t1_sp - t0_sp
+
+    # ----- Monte Carlo reference timing -----
+    t0_mc = time.perf_counter()
+
     Y_mc = []
     for _ in range(n_mc):
         theta = rng.multivariate_normal(theta_mean, theta_cov)
@@ -108,13 +118,18 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
     mc_mean = np.mean(Y_mc, axis=0)
     mc_std = np.std(Y_mc, axis=0, ddof=1)
 
+    t1_mc = time.perf_counter()
+    mc_time = t1_mc - t0_mc
+
     return {
         't': t,
         'sp_mean': sp_mean,
         'sp_std': sp_std,
         'mc_mean': mc_mean,
         'mc_std': mc_std,
-        'name': name
+        'name': name,
+        'sp_time': sp_time,
+        'mc_time': mc_time,
     }
 
 #All ODEs
@@ -234,8 +249,17 @@ for model in problems:
     )
     results.append(res)
 
-#Plotting
+# Print timing comparison between PN (SP) and MC
+for res in results:
+    name = res['name']
+    sp_time = res['sp_time']
+    mc_time = res['mc_time']
+    diff = mc_time - sp_time
+    ratio = mc_time / sp_time if sp_time > 0 else float('inf')
+    print(f"{name}: PN/SP time = {sp_time:.3f} s, MC time = {mc_time:.3f} s, "
+          f"MC - PN = {diff:.3f} s, MC/PN = {ratio:.2f}x")
 
+#Plotting
 outdir = "data"
 os.makedirs(outdir, exist_ok=True)
 saved_files = []
