@@ -24,10 +24,10 @@ def Simulate_Data(lamb=1.2, sigma_x=1.0, sigma_y=0.2, T=10.0, dt=0.05, rng=None)
 
     return t, x, y, F, Q, R
 
-# Dual (kernel) formulation
+# Dual formulation
 # K_ij = sigma_x^2 * exp(-lamb * |t_i - t_j|)
-# Smoother:  m = K (K + R I)^(-1) y,     P = K - K (K + R I)^(-1) K
-# Filter:    sequential prefix conditioning with incremental Cholesky-
+# Smoother
+# Filter
 
 def OU_kernel(t, lamb, sigma_x):
     """Stationary OU covariance kernel on a grid t."""
@@ -36,37 +36,30 @@ def OU_kernel(t, lamb, sigma_x):
 
 def chol_solve(L, b):
     """Solve (L L^T) x = b for x, given lower-triangular L (Cholesky)."""
-    # forward solve: L z = b
+    #Lz = b
     z = np.linalg.solve(L, b)
-    # back solve: L^T x = z
+    #L^T x = z
     x = np.linalg.solve(L.T, z)
     return x
 
 def dual_smoother(y, K, R, jitter=1e-9):
-    """
-    Full dual GP posterior at all time points using all data (smoothing).
-    Returns mean vector and marginal variances (diag of posterior covariance).
-    """
+    #smoother algorithm
     n = len(y)
     A = K + (R + jitter) * np.eye(n)
     # Cholesky factor of A
     L = np.linalg.cholesky(A)
-    # alpha = A^{-1} y
+    # alpha
     alpha = chol_solve(L, y)
     m = K @ alpha  # posterior mean
     # For diagonal of posterior covariance: diag(K - K A^{-1} K)
-    # Compute A^{-1} K via solves
+    # Compute A^{-1} K
     AinvK = chol_solve(L, K)  # (n x n)
     diag_term = np.einsum("ij,ji->i", K, AinvK)  # diag(K @ A^{-1} @ K)
     P_diag = np.diag(K) - diag_term
     return m, P_diag
 
 def dual_filter(y, K, R, jitter=1e-9):
-    """
-    Sequential dual filtering: at step k, condition on y[:k]
-    and report posterior mean/variance at t_k only.
-    Uses incremental Cholesky of A_k = K[:k,:k] + R I.
-    """
+    #filtering algorithm
     n = len(y)
     m_flt = np.zeros(n)
     P_flt = np.zeros(n)
@@ -76,16 +69,14 @@ def dual_filter(y, K, R, jitter=1e-9):
     L = np.array([[np.sqrt(A11)]])  # 1x1
     # alpha_1
     alpha = chol_solve(L, y[:1])  # shape (1,)
-    # mean/var at t_0
+    # mean at t_0
     m_flt[0] = K[0, 0] * alpha[0]  # since K[0,:1] @ alpha
-    # variance: K_00 - K_0,0 * (A_1^{-1} K_0,0)
+    # variance at t_0
     s = chol_solve(L, K[:1, 0])   # A_1^{-1} K[:,0] (first col)
     P_flt[0] = K[0, 0] - K[0, :1] @ s
 
-    # Iterate k = 2..n
     for k in range(1, n):
-        # Build A_k by appending row/col: A_prev -> A_k
-        # a = K[:k, k] (cross-cov to previous), a_nn = K[k,k] + R + jitter
+        # Build A_k
         a = K[:k, k].copy()
         a_nn = K[k, k] + R + jitter
 
@@ -120,11 +111,11 @@ if __name__ == "__main__":
     # Build OU kernel on this grid
     K = OU_kernel(t, lamb=lamb, sigma_x=sigma_x)
 
-    # filtering (sequential dual GP) & smoothing (full dual GP)
+    # filtering and smoothing
     m_flt, P_flt = dual_filter(y_obs, K, R)
     m_smt, P_smt = dual_smoother(y_obs, K, R)
 
-    # ---------- Static plot ----------
+    #Plot
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(t, y_obs, ".", alpha=0.6, label="observations")
     ax.plot(t, x_true, lw=1.0, label="x_true")
