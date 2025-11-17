@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 # dx_t = -λ x_t dt + sqrt(2 λ σ_x^2) dW_t
 
 def OU_model(lamb, sigma_stat, dt):
