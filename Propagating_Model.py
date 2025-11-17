@@ -1,6 +1,4 @@
 # Propagation_model
-
-
 import numpy as np
 from numpy.linalg import cholesky
 import matplotlib.pyplot as plt
@@ -13,17 +11,10 @@ import warnings
 rng = np.random.default_rng(0)
 
 def spherical_cubature(mu, Sigma):
-    """
-    Returns nodes and weights for the 3rd-degree spherical cubature rule.
-    mu: (d,) mean vector
-    Sigma: (d,d) covariance matrix (symmetric, PSD)
-    Returns:
-      nodes: (2d, d) array
-      weights: (2d,) array of equal weights 1/(2d)
-    """
+    #spherical_cubature algorithm
     mu = np.atleast_1d(mu)
     d = mu.shape[0]
-    # numerical stability: small jitter if Sigma is nearly singular
+    # numerical stability
     jitter = 1e-12 * np.eye(d)
     L = cholesky(Sigma + jitter)
     nodes = []
@@ -36,8 +27,8 @@ def spherical_cubature(mu, Sigma):
     nodes = np.stack(nodes, axis=0)
     w = np.full(2*d, 1.0/(2*d))
     return nodes, w
-#ODE
 
+#all functions from paper
 def logistic_fun(t, y, a, b):
     # y' = a y (1 - y/b)
     return a * y * (1.0 - y / b)
@@ -63,6 +54,7 @@ def vanderpol_fun(t, y, mu):
 #Wrapper to integrate with LSODA
 def integrate(fun, t_span, y0, args=(), t_eval=None, rtol=1e-6, atol=1e-8):
     sol = solve_ivp(fun, t_span, y0, method='LSODA', args=args, t_eval=t_eval, rtol=rtol, atol=atol)
+    #if problem emerges
     if not sol.success:
         warnings.warn(f"Integration failed: {sol.message}")
     return sol.t, sol.y  # t shape (M,), y shape (d, M)
@@ -86,7 +78,7 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
     dim_y = system['dim_y']
     dim_theta = system['dim_theta']
 
-    # --- Sigma points
+    #Sigma points
     nodes, w = spherical_cubature(theta_mean, theta_cov)
     # Storage for each node's trajectory
     Y_nodes = []  # list of arrays shape (dim_y, M)
@@ -99,13 +91,13 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
     # Weighted mean across nodes
     sp_mean = np.tensordot(w, Y_nodes, axes=(0,0))  # shape (dim_y, M)
 
-    # Weighted variance (component-wise) across nodes (Σ_i(t) = 0 since deterministic solver)
+    # Weighted variance across nodes (No PN part)
     # var = sum_i w_i (y_i - mean)^2
     diffs = Y_nodes - sp_mean[None, :, :]
     sp_var = np.tensordot(w, diffs**2, axes=(0,0))   # shape (dim_y, M)
     sp_std = np.sqrt(sp_var)
 
-    # Monte Carlo reference (deterministic solver)
+    # Monte Carlo reference
     Y_mc = []
     for _ in range(n_mc):
         theta = rng.multivariate_normal(theta_mean, theta_cov)
@@ -125,7 +117,7 @@ def propagate_quadrature(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400
         'name': name
     }
 
-# ---- Define the four problems ----
+#All ODEs
 
 # 1) Logistic: y' = a*y*(1 - y/b), a fixed, b ~ N(3, 0.01), y0 = 0.05
 def make_logistic_problem():
@@ -186,7 +178,7 @@ def make_vdp_problem():
         'dim_theta': 2
     }
 
-# ---- Run experiments ----
+#Run algorithms
 
 problems = []
 
@@ -231,14 +223,14 @@ problems.append({
 })
 
 results = []
-for cfg in problems:
+for model in problems:
     res = propagate_quadrature(
-        cfg['problem'],
-        cfg['t_span'],
-        cfg['t_eval'],
-        cfg['theta_mean'],
-        cfg['theta_cov'],
-        n_mc=cfg['n_mc']
+        model['problem'],
+        model['t_span'],
+        model['t_eval'],
+        model['theta_mean'],
+        model['theta_cov'],
+        n_mc=model['n_mc']
     )
     results.append(res)
 
