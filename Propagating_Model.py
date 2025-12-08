@@ -78,6 +78,11 @@ def logistic_fun(t, y, a, b):
     # y' = a y (1 - y/b)
     return a * y * (1.0 - y / b)
 
+
+def logistic_jacobian(t, y, a, b):
+    """Analytic Jacobian of the logistic RHS."""
+    return np.array([[a * (1.0 - 2.0 * y[0] / b)]])
+
 def fhn_fun(t, y, a, b, c, d):
     # FitzHugh–Nagumo in (y1, y2)
     y1, y2 = y
@@ -124,26 +129,127 @@ def J_vdp(t, y, mu=0.05):
     return np.array([[df1_dy1, df1_dy2],
                      [df2_dy1, df2_dy2]])
 
+def _numerical_jacobian(fun, t, y, eps=1e-6):
+    """
+    Finite-difference Jacobian used when an analytic Jacobian is not provided.
+    """
+    y = np.asarray(y, dtype=float)
+    d = y.size
+    J = np.zeros((d, d))
+    f0 = fun(t, y)
+    for i in range(d):
+        e = np.zeros(d)
+        e[i] = eps
+        f_plus = fun(t, y + e)
+        f_minus = fun(t, y - e)
+        J[:, i] = (f_plus - f_minus) / (2.0 * eps)
+    return J
+
+
 # Wrapper to integrate with LSODA
-def integrate(fun, t_span, y0, args=(), t_eval=None, rtol=1e-6, atol=1e-8):
+def integrate_deterministic(fun, t_span, y0, args=(), t_eval=None, rtol=1e-6, atol=1e-8):
     sol = solve_ivp(fun, t_span, y0, method='LSODA', args=args, t_eval=t_eval,
                     rtol=rtol, atol=atol)
     if not sol.success:
         warnings.warn(f"Integration failed: {sol.message}")
     return sol.t, sol.y  # t shape (M,), y shape (d, M)
 
+
+def integrate_probnum(
+    fun,
+    jac_fun,
+    t_span,
+    y0,
+    args=(),
+    t_eval=None,
+    kappa2=1.0,
+    R_scale=1e-6,
+):
+    """
+    Probabilistic ODE solver following the EK1-style IWP(1) filter used in
+    ProbNum (see https://arxiv.org/pdf/2503.04684). This mirrors the structure
+    of :func:`ek1_iwp1_goal_cov` but solves a deterministic IVP while returning a
+    distribution over solver states.
+
+    Returns t_grid, mean_y (d, M), std_y (d, M).
+    """
+    if t_eval is None:
+        raise ValueError("t_eval must be provided for probabilistic integration")
+
+    t_eval = np.asarray(t_eval)
+    if not np.allclose(np.diff(t_eval), np.diff(t_eval)[0]):
+        warnings.warn(
+            "t_eval is not uniform; EK1 step assumes fixed step size. "
+            "Using first step size as approximation."
+        )
+
+    t0, t1 = t_span
+    if not np.isclose(t_eval[0], t0):
+        raise ValueError("t_eval[0] must match t_span[0] for EK1 integration")
+
+    h = float(np.diff(t_eval)[0])
+    d = len(y0)
+
+    A, Q = iwp1_matrices(h, kappa2, d)
+    E0, E1 = build_E0_E1(d)
+    R = R_scale * np.eye(d)
+
+    def f(t, y):
+        return fun(t, y, *args)
+
+    def J_f(t, y):
+        if jac_fun is None:
+            return _numerical_jacobian(lambda _t, _y: fun(_t, _y, *args), t, y)
+        return jac_fun(t, y, *args)
+
+    m = np.concatenate([y0, f(t0, y0)])
+    P = 1e-12 * np.eye(2 * d)
+
+    y_mean = np.zeros((d, t_eval.size))
+    y_var = np.zeros_like(y_mean)
+
+    y_mean[:, 0] = y0
+    y_var[:, 0] = 0.0
+
+    for k in range(1, t_eval.size):
+        t = t_eval[k]
+
+        m_pred = A @ m
+        P_pred = A @ P @ A.T + Q
+
+        y_pred = E0 @ m_pred
+        f_val = f(t, y_pred)
+        Jf = J_f(t, y_pred)
+
+        h_pred = E1 @ m_pred - f_val
+        H = np.hstack([-Jf, np.eye(d)])
+
+        S = H @ P_pred @ H.T + R
+        K = np.linalg.solve(S, (P_pred @ H.T).T).T
+
+        m = m_pred + K @ (-h_pred)
+        P = P_pred - K @ S @ K.T
+
+        P_y = E0 @ P @ E0.T
+        y_mean[:, k] = E0 @ m
+        y_var[:, k] = np.diag(P_y)
+
+    return t_eval, y_mean, np.sqrt(y_var)
+
 # ============================================================
 # Propagation: deterministic quadrature + Monte Carlo
 # ============================================================
 
 def propagate_deterministic(system, t_span, t_eval, theta_mean, theta_cov,
-                            quad_method="spherical", n_gh_1d=5):
+                            quad_method="spherical", n_gh_1d=5,
+                            solver="probnum"):
     """
     Propagate uncertainty using a deterministic quadrature rule
     (spherical cubature or Gauss–Hermite) over theta.
     """
     name = system['name']
     ode_fun = system['ode_fun']
+    jac_fun = system.get('jac_fun')
     theta_to_setup = system['theta_to_setup']
 
     t0 = time.perf_counter()
@@ -160,15 +266,32 @@ def propagate_deterministic(system, t_span, t_eval, theta_mean, theta_cov,
     t_out = None
     for th in nodes:
         y0, params = theta_to_setup(th)
-        t, y = integrate(ode_fun, t_span, y0, args=params, t_eval=t_eval)
+        if solver == "probnum":
+            t, y_mean, y_std = integrate_probnum(
+                ode_fun, jac_fun, t_span, y0, args=params, t_eval=t_eval
+            )
+            y = y_mean
+            y_var = y_std ** 2
+        elif solver == "deterministic":
+            t, y_det = integrate_deterministic(
+                ode_fun, t_span, y0, args=params, t_eval=t_eval
+            )
+            y = y_det
+            y_var = np.zeros_like(y_det)
+        else:
+            raise ValueError(f"Unknown solver: {solver}")
+
         if t_out is None:
             t_out = t
-        Y_nodes.append(y)
-    Y_nodes = np.stack(Y_nodes, axis=0)  # (K, dim_y, M)
+        Y_nodes.append((y, y_var))
 
-    mean = np.tensordot(w, Y_nodes, axes=(0, 0))  # (dim_y, M)
-    diffs = Y_nodes - mean[None, :, :]
-    var = np.tensordot(w, diffs**2, axes=(0, 0))  # (dim_y, M)
+    # Weighted mean and variance (including solver covariance)
+    Y_means = np.stack([p[0] for p in Y_nodes], axis=0)
+    Y_vars = np.stack([p[1] for p in Y_nodes], axis=0)
+
+    mean = np.tensordot(w, Y_means, axes=(0, 0))
+    diffs = Y_means - mean[None, :, :]
+    var = np.tensordot(w, Y_vars + diffs**2, axes=(0, 0))
     std = np.sqrt(var)
 
     t1 = time.perf_counter()
@@ -181,28 +304,48 @@ def propagate_deterministic(system, t_span, t_eval, theta_mean, theta_cov,
         'name': name
     }
 
-def propagate_mc(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400):
+def propagate_mc(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400,
+                 solver="probnum"):
     """
     Monte Carlo reference propagation.
     """
     name = system['name']
     ode_fun = system['ode_fun']
+    jac_fun = system.get('jac_fun')
     theta_to_setup = system['theta_to_setup']
 
     t0 = time.perf_counter()
 
     Y_mc = []
+    Y_vars = []
     t_out = None
     for _ in range(n_mc):
         theta = rng.multivariate_normal(theta_mean, theta_cov)
         y0, params = theta_to_setup(theta)
-        t, y = integrate(ode_fun, t_span, y0, args=params, t_eval=t_eval)
+        if solver == "probnum":
+            t, y_mean, y_std = integrate_probnum(
+                ode_fun, jac_fun, t_span, y0, args=params, t_eval=t_eval
+            )
+            y_var = y_std ** 2
+            y = y_mean
+        elif solver == "deterministic":
+            t, y = integrate_deterministic(
+                ode_fun, t_span, y0, args=params, t_eval=t_eval
+            )
+            y_var = np.zeros_like(y)
+        else:
+            raise ValueError(f"Unknown solver: {solver}")
+
         if t_out is None:
             t_out = t
         Y_mc.append(y)
-    Y_mc = np.stack(Y_mc, axis=0)  # (n_mc, dim_y, M)
+        Y_vars.append(y_var)
+
+    Y_mc = np.stack(Y_mc, axis=0)
+    Y_vars = np.stack(Y_vars, axis=0)
     mc_mean = np.mean(Y_mc, axis=0)
-    mc_std = np.std(Y_mc, axis=0, ddof=1)
+    mc_var = np.mean(Y_vars, axis=0) + np.var(Y_mc, axis=0, ddof=1)
+    mc_std = np.sqrt(mc_var)
 
     t1 = time.perf_counter()
     return {
@@ -417,6 +560,7 @@ def make_logistic_problem():
     return {
         'name': 'Logistic',
         'ode_fun': lambda t, y, a, b: logistic_fun(t, y, a, b),
+        'jac_fun': lambda t, y, a, b: logistic_jacobian(t, y, a, b),
         'theta_to_setup': theta_to_setup,
         'dim_y': 1,
         'dim_theta': 1
@@ -431,6 +575,7 @@ def make_fhn_problem():
     return {
         'name': 'FitzHugh–Nagumo',
         'ode_fun': lambda t, y, a, b, c, d: fhn_fun(t, y, a, b, c, d),
+        'jac_fun': lambda t, y, a, b, c, d: J_fhn(t, y, a, b, c, d),
         'theta_to_setup': theta_to_setup,
         'dim_y': 2,
         'dim_theta': 2
@@ -444,6 +589,7 @@ def make_lv_problem():
     return {
         'name': 'Lotka–Volterra',
         'ode_fun': lambda t, y, a, b, c, d: lotkavolterra_fun(t, y, a, b, c, d),
+        'jac_fun': lambda t, y, a, b, c, d: J_lv(t, y, a, b, c, d),
         'theta_to_setup': theta_to_setup,
         'dim_y': 2,
         'dim_theta': 2
@@ -457,6 +603,7 @@ def make_vdp_problem():
     return {
         'name': 'Van der Pol',
         'ode_fun': lambda t, y, mu: vanderpol_fun(t, y, mu),
+        'jac_fun': lambda t, y, mu: J_vdp(t, y, mu),
         'theta_to_setup': theta_to_setup,
         'dim_y': 2,
         'dim_theta': 2
