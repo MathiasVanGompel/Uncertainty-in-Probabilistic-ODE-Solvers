@@ -512,9 +512,6 @@ def propagate_pn_iwp1_goal(system, t_span, t_eval, theta_mean, theta_cov,
     """
     Wrapper to run the IWP(1)+EK1+Jacobian goal-variance method
     for systems where theta is the uncertain initial state y(0).
-
-    For logistic (parameter uncertainty), this method is not applicable:
-    returns None.
     """
     name = system['name']
     dim_y = system['dim_y']
@@ -542,7 +539,7 @@ def propagate_pn_iwp1_goal(system, t_span, t_eval, theta_mean, theta_cov,
 
     # Use same grid as t_eval (assumed uniform)
     T0, T1 = t_span
-    assert T0 == 0.0, "EK1 assumes t0=0.0"
+    assert T0 == 0.0
     N = len(t_eval) - 1
     T = T1 - T0
     h = T / N
@@ -659,7 +656,6 @@ problems.append({
     't_span': (0.0, 3.0),
     't_eval': np.linspace(0.0, 3.0, 400),
     'n_mc': 600,
-    # Step size used by ProbNum EK1 + IWP(1) in Yao et al.
     'pn_step': 1e-2,
 })
 
