@@ -103,7 +103,7 @@ def dual_filter(y, K, R, jitter=1e-9):
 if __name__ == "__main__":
     # simulate
     t, x_true, y_obs, F, Q, R = Simulate_Data(
-        lamb=1.1, sigma_x=1.0, sigma_y=0, T=12.0, dt=0.05, rng=np.random.default_rng(0)
+        lamb=1.1, sigma_x=1.0, sigma_y=0.5, T=12.0, dt=0.05, rng=np.random.default_rng(0)
     )
     lamb = 1.1
     sigma_x = 1.0

@@ -305,7 +305,7 @@ def propagate_deterministic(system, t_span, t_eval, theta_mean, theta_cov,
     }
 
 def propagate_mc(system, t_span, t_eval, theta_mean, theta_cov, n_mc=400,
-                 solver="probnum"):
+                 solver="deterministic"):
     """
     Monte Carlo reference propagation.
     """
@@ -641,8 +641,8 @@ problems.append({
     'theta_mean': np.array([5.0, 5.0]),
     'theta_cov': 0.3 * np.eye(2),
     't_span': (0.0, 2.0),
-    't_eval': np.linspace(0.0, 2.0, 400),
-    'n_mc': 600
+    't_eval': np.linspace(0.0, 2.0, 1200),
+    'n_mc': 1200
 })
 
 # Van der Pol
