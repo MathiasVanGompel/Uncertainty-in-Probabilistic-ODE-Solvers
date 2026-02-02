@@ -1,7 +1,7 @@
 """
 How to run (examples):
   python uncertainty.py --problem logistic --method both
-  python uncertainty.py --problem lv --method ghbq --gh-order 3
+  python uncertainty.py --problem lv --method BHKF --gh-order 3
   python uncertainty.py --problem vdp --method goal --no-smoother
 """
 
@@ -762,34 +762,79 @@ def gh_tensor_nodes(order: int, dim: int) -> Array:
     X = np.stack([g.reshape(-1) for g in grids], axis=1)
     return X
 
-def rbf_K(X: Array, ell: float, jitter: float = 1e-10) -> Array:
+def rbf_K(X: Array, ell: float, alpha2: float = 1.0, jitter: float = 1e-10) -> Array:
+    """EQ kernel Gram matrix: k(x,x') = alpha2 * exp(-||x-x'||^2/(2 ell^2))."""
     X = np.asarray(X, dtype=float)
     d2 = np.sum((X[:, None, :] - X[None, :, :]) ** 2, axis=2)
-    K = np.exp(-0.5 * d2 / (ell ** 2))
-    K = K + jitter * np.eye(X.shape[0], dtype=float)
+    K = float(alpha2) * np.exp(-0.5 * d2 / (float(ell) ** 2))
+    K = K + float(jitter) * np.eye(X.shape[0], dtype=float)
     return K
 
-def bq_mean_weights_stdnormal(X: Array, ell: float, jitter: float = 1e-10) -> Array:
+
+def bq_L_stdnormal(X: Array, ell: float, alpha2: float = 1.0) -> Array:
     """
-    BQ mean weights for ∫ f(u) N(u;0,I) du using EQ kernel k(u,u') = exp(-||u-u'||^2/(2 ell^2)).
-    Closed-form kernel mean under standard normal:
-      l_i = E[k(U, x_i)] = (ell^2/(ell^2+1))^{d/2} * exp(-||x_i||^2 / (2(ell^2+1))).
+    L_ij = E[ k(x_i, U) k(U, x_j) ]  for U ~ N(0, I)
     """
     X = np.asarray(X, dtype=float)
     N, d = X.shape
     ell = float(ell)
+    alpha2 = float(alpha2)
 
-    K = rbf_K(X, ell=ell, jitter=jitter)
+    r = np.sum(X ** 2, axis=1)     # (N,)
+    dot = X @ X.T                  # (N,N)
+
+    c = (alpha2 ** 2) * ((ell ** 2) / (ell ** 2 + 2.0)) ** (0.5 * d)
+    E = (2.0 * dot - (ell ** 2 + 1.0) * (r[:, None] + r[None, :])) / (2.0 * ell ** 2 * (ell ** 2 + 2.0))
+    return c * np.exp(E)
+
+
+def bq_bhkf_weights_stdnormal(
+    X: Array,
+    *,
+    ell: float,
+    alpha2: float = 1.0,
+    jitter: float = 1e-10,
+) -> Tuple[Array, Array, float]:
+    """
+    Returns (w, W, diag_add) for BHKF:
+      w = K^{-1} l
+      W = K^{-1} L K^{-1}
+      diag_add = alpha2 - tr(K^{-1} L)
+    """
+    X = np.asarray(X, dtype=float)
+    N, d = X.shape
+    ell = float(ell)
+    alpha2 = float(alpha2)
+    jitter = float(jitter)
+
+    # K and l
+    K = rbf_K(X, ell=ell, alpha2=alpha2, jitter=jitter)
     c = (ell ** 2 / (ell ** 2 + 1.0)) ** (0.5 * d)
     quad = np.sum(X ** 2, axis=1)
-    l = c * np.exp(-0.5 * quad / (ell ** 2 + 1.0))
-    w = np.linalg.solve(K, l)
-    # optional normalization (helps when K/jitter makes sum drift)
-    s = float(np.sum(w))
-    if not np.isfinite(s) or abs(s) < 1e-14:
-        return w
-    return w / s
+    l = alpha2 * c * np.exp(-0.5 * quad / (ell ** 2 + 1.0))
 
+    # L
+    Lmat = bq_L_stdnormal(X, ell=ell, alpha2=alpha2)
+
+    # Cholesky solves for stability
+    Lk = _chol_spd(K, jitter=0.0, max_tries=8)  # K already has jitter
+
+    # w = K^{-1} l
+    y = _solve_triangular(Lk, l, lower=True)
+    w = _solve_triangular(Lk.T, y, lower=False)
+
+    # tmp = K^{-1} L
+    tmp = _solve_triangular(Lk, Lmat, lower=True)
+    tmp = _solve_triangular(Lk.T, tmp, lower=False)
+    tr_KinvL = float(np.trace(tmp))
+
+    # W = K^{-1} L K^{-1} (compute as solve(K, tmp.T).T)
+    tmp2 = _solve_triangular(Lk, tmp.T, lower=True)
+    tmp2 = _solve_triangular(Lk.T, tmp2, lower=False)
+    W = _sym(tmp2.T)
+
+    diag_add = alpha2 - tr_KinvL
+    return w, W, float(diag_add)
 
 # ODEs
 def problems_paper() -> Dict[str, ODEProblem]:
@@ -1029,7 +1074,8 @@ def propagate_gh_bq(
 
     # GH nodes in whitened coordinates u ~ N(0,I)
     X = gh_tensor_nodes(gh_order, dim=active.size)  # (N, d_active)
-    w = bq_mean_weights_stdnormal(X, ell=bq_ell, jitter=1e-10)  # (N,)
+    w, W, diag_add = bq_bhkf_weights_stdnormal(X, ell=bq_ell, alpha2=1.0, jitter=1e-10)
+
 
     N = X.shape[0]
     # storage of each node solution
@@ -1076,17 +1122,21 @@ def propagate_gh_bq(
     t = np.asarray(t_eval, dtype=float).reshape(-1)
     Tn = t.size
 
-    # mixture mean
     mean = np.tensordot(w, mus, axes=(0, 0))  # (T, d)
-    # PN covariance part
     cov_pn = np.tensordot(w, cov_pns, axes=(0, 0))  # (T, d, d)
-    # non-PN part from mean spread
-    cov_np = np.zeros((Tn, d_ode, d_ode), dtype=float)
-    for i in range(N):
-        dm = (mus[i] - mean)  # (T,d)
-        cov_np += w[i] * np.einsum("ti,tj->tij", dm, dm)
 
-    cov_total = cov_pn + cov_np
+    # BHKF covariance of conditional means (paper Eq. (32))
+    Tn = mean.shape[0]
+    d_ode = mean.shape[1]
+    I = np.eye(d_ode, dtype=float)
+
+    cov_bq = np.zeros((Tn, d_ode, d_ode), dtype=float)
+    for k in range(Tn):
+        G = mus[:, k, :]  # (N, d)
+        mu = mean[k]  # (d,)
+        cov_bq[k] = _sym(G.T @ W @ G - np.outer(mu, mu) + diag_add * I)
+
+    cov_total = cov_pn + cov_bq
     return t, mean, cov_total, cov_pn
 
 
@@ -1159,7 +1209,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--problem", type=str, default="logistic", choices=sorted(probs.keys()))
-    ap.add_argument("--method", type=str, default="both", choices=["goal", "ghbq", "both"])
+    ap.add_argument("--method", type=str, default="both", choices=["goal", "BHKF", "both"])
     ap.add_argument("--q", type=int, default=3)
     ap.add_argument("--no-smoother", action="store_true")
     ap.add_argument("--no-precondition", action="store_true")
@@ -1171,7 +1221,7 @@ def main() -> None:
     ap.add_argument("--h-max", type=float, default=1.0)
 
     ap.add_argument("--t-steps", type=int, default=200)
-    ap.add_argument("--gh-order", type=int, default=3)
+    ap.add_argument("--gh-order", type=int, default=5)
     ap.add_argument("--bq-ell", type=float, default=1.0)
 
     ap.add_argument("--figdir", type=str, default="figures")
@@ -1218,7 +1268,7 @@ def main() -> None:
             outpath=os.path.join(args.figdir, f"{prob.name}_goal_pn.png"),
         )
 
-    if args.method in ("ghbq", "both"):
+    if args.method in ("BHKF", "both"):
         t_start = time.perf_counter()
         t, mean, cov_total, cov_pn = propagate_gh_bq(
             prob,
@@ -1237,17 +1287,17 @@ def main() -> None:
         )
         t_end = time.perf_counter()
         n_unc = (prob.y0_mean.size) + (0 if prob.theta_mean is None else prob.theta_mean.size)
-        print(f"[ghbq] gh_order={args.gh_order}, approx_nodes={args.gh_order**n_unc} (before dropping zero-variance dims), runtime={t_end - t_start:.2f}s")
+        print(f"[BHKF] gh_order={args.gh_order}, approx_nodes={args.gh_order**n_unc} (before dropping zero-variance dims), runtime={t_end - t_start:.2f}s")
 
         plot_bands(
             t, mean, cov_total,
-            title=f"{prob.name}: GH+BQ propagation (total)",
-            outpath=os.path.join(args.figdir, f"{prob.name}_ghbq_total.png"),
+            title=f"{prob.name}: BHKF propagation (total)",
+            outpath=os.path.join(args.figdir, f"{prob.name}_BHKF_total.png"),
         )
         plot_var_decomp(
             t, cov_total, cov_pn,
-            title=f"{prob.name}: GH+BQ variance decomposition",
-            outpath=os.path.join(args.figdir, f"{prob.name}_ghbq_decomp.png"),
+            title=f"{prob.name}: BHKF variance decomposition",
+            outpath=os.path.join(args.figdir, f"{prob.name}_BHKF_decomp.png"),
             comp=0,
         )
 
