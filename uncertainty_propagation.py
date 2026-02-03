@@ -1051,7 +1051,9 @@ def propagate_gh_bq(
     m_in = np.concatenate([y0m, thm]) if p_dim > 0 else y0m
     Py0 = np.zeros((d_ode, d_ode), dtype=float) if problem.y0_cov is None else np.asarray(problem.y0_cov, dtype=float)
     if p_dim > 0:
-        Pth = np.zeros((p_dim, p_dim), dtype=float) if problem.theta_cov is None else np.asarray(problem.theta_cov, dtype=float)
+        Pth = (np.zeros((p_dim, p_dim), dtype=float) if problem.theta_cov is None
+               else np.asarray(problem.theta_cov, dtype=float)) if p_dim > 0 else None
+
     else:
         Pth = None
 
