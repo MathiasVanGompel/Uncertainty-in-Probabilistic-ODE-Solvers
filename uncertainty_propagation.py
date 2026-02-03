@@ -146,7 +146,7 @@ class AdaptiveIWP_EKS1_Goal_Sqrt:
       - square-root (Cholesky) predict/update
       - Jacobian recursion for goal covariance
 
-    Measurement: z(t) = y'(t) - f(t, y(t), theta) = 0  (dimension d_ode)
+    Measurement: z(t) = y'(t) - f(t, y(t), theta) = 0
     """
 
     def __init__(
@@ -1050,7 +1050,10 @@ def propagate_gh_bq(
     # joint mean and cov
     m_in = np.concatenate([y0m, thm]) if p_dim > 0 else y0m
     Py0 = np.zeros((d_ode, d_ode), dtype=float) if problem.y0_cov is None else np.asarray(problem.y0_cov, dtype=float)
-    Pth = np.zeros((p_dim, p_dim), dtype=float) if p_dim > 0 and problem.theta_cov is not None else (np.zeros((p_dim, p_dim)) if p_dim > 0 else None)
+    if p_dim > 0:
+        Pth = np.zeros((p_dim, p_dim), dtype=float) if problem.theta_cov is None else np.asarray(problem.theta_cov, dtype=float)
+    else:
+        Pth = None
 
     if p_dim > 0:
         P = np.block([[Py0, np.zeros((d_ode, p_dim))],
@@ -1221,7 +1224,7 @@ def main() -> None:
     ap.add_argument("--h-max", type=float, default=1.0)
 
     ap.add_argument("--t-steps", type=int, default=200)
-    ap.add_argument("--gh-order", type=int, default=5)
+    ap.add_argument("--gh-order", type=int, default=6)
     ap.add_argument("--bq-ell", type=float, default=1.0)
 
     ap.add_argument("--figdir", type=str, default="figures")
