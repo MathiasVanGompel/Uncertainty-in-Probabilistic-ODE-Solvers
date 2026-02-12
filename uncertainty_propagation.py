@@ -1,14 +1,16 @@
 """
 How to run (examples):
-  python uncertainty.py --problem logistic --method both
-  python uncertainty.py --problem lv --method BHKF --gh-order 3
-  python uncertainty.py --problem vdp --method goal --no-smoother
+  python uncertainty_propagation.py --problem logistic --method both
+  python uncertainty_propagation.py --problem lv --method BHKF --gh-order 3
+  python uncertainty_propagation.py --problem vdp --method goal --no-smoother
+  python uncertainty_propagation.py --problem logistic --method both --mc-samples 2000 --plot-together
+  python uncertainty_propagation.py --problem logistic --method goal --mc-samples 5000 --plot-together --compare-comp 1
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import argparse
 import math
@@ -17,11 +19,22 @@ import time
 
 import numpy as np
 import matplotlib.pyplot as plt
+from numpy import dtype, ndarray
 
 try:
     from scipy.linalg import solve_triangular as _scipy_solve_triangular
 except Exception:  # pragma: no cover
     _scipy_solve_triangular = None
+
+try:
+    from scipy.integrate import solve_ivp as _scipy_solve_ivp
+except Exception:  # pragma: no cover
+    _scipy_solve_ivp = None
+
+try:
+    from scipy.integrate import solve_ivp as _scipy_solve_ivp
+except Exception:  # pragma: no cover
+    _scipy_solve_ivp = None
 
 Array = np.ndarray
 
@@ -54,6 +67,46 @@ def _solve_triangular(L: Array, B: Array, *, lower: bool) -> Array:
 
 def _kron_eye(d: int, M: Array) -> Array:
     return np.kron(np.eye(d, dtype=float), M)
+
+
+def _integrate_reference(
+    f: Callable[[float, Array, Optional[Array]], Array],
+    *,
+    t_span: Tuple[float, float],
+    y0: Array,
+    theta: Optional[Array],
+    t_eval: Array,
+    method: str = "DOP853",
+    rtol: float = 1e-10,
+    atol: float = 1e-12,
+    rk4_substeps: int = 10,
+) -> ndarray[tuple[Any, ...], dtype[Any]] | None:
+    """Deterministic reference integrator used for Monte Carlo.
+
+    Returns y(t_eval) with shape (T, d).
+    """
+    t_eval = np.asarray(t_eval, dtype=float).reshape(-1)
+    t0, t1 = float(t_span[0]), float(t_span[1])
+    y0 = np.asarray(y0, dtype=float).reshape(-1)
+
+    def rhs(t: float, y: Array) -> Array:
+        return np.asarray(f(float(t), np.asarray(y, dtype=float).reshape(-1), theta), dtype=float).reshape(-1)
+
+    if _scipy_solve_ivp is not None:
+        sol = _scipy_solve_ivp(
+            rhs,
+            (t0, t1),
+            y0,
+            t_eval=t_eval,
+            method=str(method),
+            rtol=float(rtol),
+            atol=float(atol),
+        )
+        if not sol.success:
+            raise RuntimeError(f"solve_ivp failed: {sol.message}")
+        Y = np.asarray(sol.y, dtype=float).T  # (d, T) -> (T, d)
+        return Y
+
 
 
 # IWP prior (order q, dimension q+1)
@@ -160,8 +213,8 @@ class AdaptiveIWP_EKS1_Goal_Sqrt:
         atol: float = 1e-9,
         rtol: float = 1e-5,
         rho: float = 0.7,
-        eta_min: float = 0.001,
-        eta_max: float = 100.0,
+        eta_min: float = 0.0001,
+        eta_max: float = 1000.0,
         diffusion_init: float = 1.0,
         diffusion_floor: float = 1e-16,
         diffusion_ceiling: float = 1e16,
@@ -1145,6 +1198,128 @@ def propagate_gh_bq(
     return t, mean, cov_total, cov_pn
 
 
+# Monte Carlo reference
+
+def _integrate_deterministic(
+    problem: ODEProblem,
+    *,
+    y0: Array,
+    theta: Optional[Array],
+    t_eval: Array,
+    rtol: float = 1e-10,
+    atol: float = 1e-12,
+    method: str = "DOP853",
+) -> Array:
+    """Deterministic ODE solve for a single (y0, theta) at t_eval.
+    """
+    t_eval = np.asarray(t_eval, dtype=float).reshape(-1)
+    t0, t1 = float(problem.t_span[0]), float(problem.t_span[1])
+    y0 = np.asarray(y0, dtype=float).reshape(-1)
+
+    def rhs(t: float, y: Array) -> Array:
+        return np.asarray(problem.f(float(t), np.asarray(y, dtype=float).reshape(-1), theta), dtype=float)
+
+    if _scipy_solve_ivp is not None:
+        sol = _scipy_solve_ivp(
+            rhs,
+            (t0, t1),
+            y0,
+            t_eval=t_eval,
+            method=str(method),
+            rtol=float(rtol),
+            atol=float(atol),
+            vectorized=False,
+        )
+        if not sol.success:
+            raise RuntimeError(f"solve_ivp failed: {sol.message}")
+        return np.asarray(sol.y.T, dtype=float)
+
+
+def propagate_mc_reference(
+    problem: ODEProblem,
+    *,
+    n_samples: int,
+    t_eval: Array,
+    seed: int = 0,
+    rtol: float = 1e-10,
+    atol: float = 1e-12,
+    method: str = "DOP853",
+) -> Tuple[Array, Array, Array]:
+    """Monte Carlo reference over the (y0, theta) input distribution.
+
+    Returns:
+      t, mean_mc, cov_mc
+    where cov_mc is the empirical covariance across samples at each time.
+
+    Notes:
+      - This is a *reference* for input uncertainty only (no PN).
+      - If some input dimensions have 0 variance, they are treated as deterministic.
+    """
+    if n_samples < 1:
+        raise ValueError("n_samples must be >= 1")
+
+    y0m = np.asarray(problem.y0_mean, dtype=float).reshape(-1)
+    d_ode = int(y0m.size)
+    thm = None if problem.theta_mean is None else np.asarray(problem.theta_mean, dtype=float).reshape(-1)
+    p_dim = 0 if thm is None else int(thm.size)
+
+    m_in = np.concatenate([y0m, thm]) if p_dim > 0 else y0m
+
+    Py0 = np.zeros((d_ode, d_ode), dtype=float) if problem.y0_cov is None else np.asarray(problem.y0_cov, dtype=float)
+    if Py0.shape != (d_ode, d_ode):
+        raise ValueError(f"problem.y0_cov must be ({d_ode},{d_ode})")
+
+    if p_dim > 0:
+        Pth = (np.zeros((p_dim, p_dim), dtype=float) if problem.theta_cov is None
+               else np.asarray(problem.theta_cov, dtype=float))
+        if Pth.shape != (p_dim, p_dim):
+            raise ValueError(f"problem.theta_cov must be ({p_dim},{p_dim})")
+        P = np.block([[Py0, np.zeros((d_ode, p_dim))],
+                      [np.zeros((p_dim, d_ode)), Pth]])
+    else:
+        P = Py0
+
+    diag = np.diag(P)
+    active = np.where(diag > 0.0)[0]
+
+    rng = np.random.default_rng(int(seed))
+
+    if active.size > 0:
+        P_red = P[np.ix_(active, active)]
+        L = _chol_spd(P_red, jitter=1e-18, max_tries=8)
+        Z = rng.standard_normal(size=(n_samples, active.size))
+        X_red = m_in[active][None, :] + Z @ L.T  # (N, d_active)
+    else:
+        X_red = np.zeros((n_samples, 0), dtype=float)
+
+    t_eval = np.asarray(t_eval, dtype=float).reshape(-1)
+    Tn = int(t_eval.size)
+    samples = np.zeros((n_samples, Tn, d_ode), dtype=float)
+
+    for i in range(n_samples):
+        x_full = m_in.copy()
+        if active.size > 0:
+            x_full[active] = X_red[i]
+
+        y0_i = x_full[:d_ode]
+        th_i = None if p_dim == 0 else x_full[d_ode:]
+        ys = _integrate_deterministic(
+            problem,
+            y0=y0_i,
+            theta=th_i,
+            t_eval=t_eval,
+            rtol=rtol,
+            atol=atol,
+            method=method,
+        )
+        samples[i] = ys
+
+    mean = np.mean(samples, axis=0)
+    centered = samples - mean[None, :, :]
+    cov = np.einsum("ntd,nte->tde", centered, centered) / float(max(n_samples - 1, 1))
+    return t_eval, mean, cov
+
+
 # Plotting
 def _ensure_dir(p: str) -> None:
     if p and not os.path.isdir(p):
@@ -1209,12 +1384,48 @@ def plot_var_decomp(
     plt.close(fig)
 
 
+def plot_compare_component(
+    t: Array,
+    series: List[Tuple[str, Array, Array]],
+    *,
+    title: str,
+    outpath: str,
+    comp: int = 0,
+):
+    """Overlay multiple (mean, cov) trajectories for a single component."""
+    t = np.asarray(t, dtype=float).reshape(-1)
+    if len(series) == 0:
+        raise ValueError("Need at least one series")
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    for label, mean, cov in series:
+        mean = np.asarray(mean, dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        if mean.ndim != 2 or cov.ndim != 3:
+            raise ValueError("mean must be (T,d) and cov must be (T,d,d)")
+        if comp < 0 or comp >= mean.shape[1]:
+            raise ValueError(f"comp index {comp} out of range for d={mean.shape[1]}")
+
+        mu = mean[:, comp]
+        sd = np.sqrt(np.maximum(cov[:, comp, comp], 0.0))
+        (ln,) = ax.plot(t, mu, label=label)
+        ax.fill_between(t, mu - 1.96 * sd, mu + 1.96 * sd, color=ln.get_color(), alpha=0.15)
+
+    ax.set_title(title + f" (component {comp})")
+    ax.set_xlabel("t")
+    ax.set_ylabel("y")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=160)
+    plt.close(fig)
+
+
 def main() -> None:
     probs = problems_paper()
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--problem", type=str, default="logistic", choices=sorted(probs.keys()))
-    ap.add_argument("--method", type=str, default="both", choices=["goal", "BHKF", "both"])
+    ap.add_argument("--method", type=str, default="both", choices=["goal", "BHKF", "both", "MC"])
     ap.add_argument("--q", type=int, default=3)
     ap.add_argument("--no-smoother", action="store_true")
     ap.add_argument("--no-precondition", action="store_true")
@@ -1229,6 +1440,17 @@ def main() -> None:
     ap.add_argument("--gh-order", type=int, default=6)
     ap.add_argument("--bq-ell", type=float, default=1.0)
 
+    # Monte Carlo reference (input uncertainty only)
+    ap.add_argument("--mc-samples", type=int, default=0, help="If >0, compute an MC reference with this many samples.")
+    ap.add_argument("--mc-seed", type=int, default=0)
+    ap.add_argument("--mc-rtol", type=float, default=1e-10)
+    ap.add_argument("--mc-atol", type=float, default=1e-12)
+    ap.add_argument("--mc-method", type=str, default="DOP853", help="solve_ivp method name (ignored for RK4 fallback)")
+
+    # Plotting
+    ap.add_argument("--plot-together", action="store_true", help="Overlay available methods in one comparison plot.")
+    ap.add_argument("--compare-comp", type=int, default=0, help="Component index to compare when --plot-together is set.")
+
     ap.add_argument("--figdir", type=str, default="figures")
 
     args = ap.parse_args()
@@ -1241,6 +1463,26 @@ def main() -> None:
     precondition = not args.no_precondition
 
     _ensure_dir(args.figdir)
+
+    if args.method == "MC" and args.mc_samples <= 0:
+        raise ValueError("--method MC requires --mc-samples > 0")
+
+    compare_series: List[Tuple[str, Array, Array]] = []
+
+    def _align_to_eval(t_src: Array, mean_src: Array, cov_src: Array) -> Tuple[Array, Array]:
+        """Align (mean,cov) defined on t_src onto the global t_eval via linear interpolation."""
+        t_src = np.asarray(t_src, dtype=float).reshape(-1)
+        mean_src = np.asarray(mean_src, dtype=float)
+        cov_src = np.asarray(cov_src, dtype=float)
+        if t_src.shape[0] == t_eval.shape[0] and np.allclose(t_src, t_eval, rtol=0.0, atol=1e-10):
+            return mean_src, cov_src
+        d = mean_src.shape[1]
+        mean_al = np.stack([np.interp(t_eval, t_src, mean_src[:, j]) for j in range(d)], axis=1)
+        cov_al = np.zeros((t_eval.size, d, d), dtype=float)
+        for i in range(d):
+            for j in range(d):
+                cov_al[:, i, j] = np.interp(t_eval, t_src, cov_src[:, i, j])
+        return mean_al, cov_al
 
     if args.method in ("goal", "both"):
         t_start = time.perf_counter()
@@ -1258,20 +1500,29 @@ def main() -> None:
             t_eval=t_eval,
         )
         t_end = time.perf_counter()
-        print(f"[goal] accepted={res.stats.accepted_steps}, rejected={res.stats.rejected_steps}, "
-              f"h_min={res.stats.min_step:.3e}, h_max={res.stats.max_step:.3e}, "
-              f"runtime={t_end - t_start:.2f}s")
+        print(
+            f"[goal] accepted={res.stats.accepted_steps}, rejected={res.stats.rejected_steps}, "
+            f"h_min={res.stats.min_step:.3e}, h_max={res.stats.max_step:.3e}, "
+            f"runtime={t_end - t_start:.2f}s"
+        )
 
         plot_bands(
-            res.t, res.mean, res.cov_goal,
+            res.t,
+            res.mean,
+            res.cov_goal,
             title=f"{prob.name}: goal propagation (total)",
             outpath=os.path.join(args.figdir, f"{prob.name}_goal_total.png"),
         )
         plot_bands(
-            res.t, res.mean, res.cov_cond,
+            res.t,
+            res.mean,
+            res.cov_cond,
             title=f"{prob.name}: goal propagation (PN only)",
             outpath=os.path.join(args.figdir, f"{prob.name}_goal_pn.png"),
         )
+
+        m_al, c_al = _align_to_eval(res.t, res.mean, res.cov_goal)
+        compare_series.append(("goal", m_al, c_al))
 
     if args.method in ("BHKF", "both"):
         t_start = time.perf_counter()
@@ -1292,18 +1543,65 @@ def main() -> None:
         )
         t_end = time.perf_counter()
         n_unc = (prob.y0_mean.size) + (0 if prob.theta_mean is None else prob.theta_mean.size)
-        print(f"[BHKF] gh_order={args.gh_order}, approx_nodes={args.gh_order**n_unc} (before dropping zero-variance dims), runtime={t_end - t_start:.2f}s")
+        print(
+            f"[BHKF] gh_order={args.gh_order}, approx_nodes={args.gh_order**n_unc} "
+            f"(before dropping zero-variance dims), runtime={t_end - t_start:.2f}s"
+        )
 
         plot_bands(
-            t, mean, cov_total,
+            t,
+            mean,
+            cov_total,
             title=f"{prob.name}: BHKF propagation (total)",
             outpath=os.path.join(args.figdir, f"{prob.name}_BHKF_total.png"),
         )
         plot_var_decomp(
-            t, cov_total, cov_pn,
+            t,
+            cov_total,
+            cov_pn,
             title=f"{prob.name}: BHKF variance decomposition",
             outpath=os.path.join(args.figdir, f"{prob.name}_BHKF_decomp.png"),
             comp=0,
+        )
+
+        m_al, c_al = _align_to_eval(t, mean, cov_total)
+        compare_series.append(("BHKF", m_al, c_al))
+
+    if args.mc_samples > 0 or args.method == "MC":
+        t_start = time.perf_counter()
+        t_mc, mean_mc, cov_mc = propagate_mc_reference(
+            prob,
+            n_samples=int(args.mc_samples),
+            t_eval=t_eval,
+            seed=int(args.mc_seed),
+            rtol=float(args.mc_rtol),
+            atol=float(args.mc_atol),
+            method=str(args.mc_method),
+        )
+        t_end = time.perf_counter()
+        print(f"[MC] samples={int(args.mc_samples)}, runtime={t_end - t_start:.2f}s")
+
+        plot_bands(
+            t_mc,
+            mean_mc,
+            cov_mc,
+            title=f"{prob.name}: Monte Carlo reference (input uncertainty)",
+            outpath=os.path.join(args.figdir, f"{prob.name}_MC_total.png"),
+        )
+
+        m_al, c_al = _align_to_eval(t_mc, mean_mc, cov_mc)
+        compare_series.append(("MC", m_al, c_al))
+
+    if args.plot_together:
+        if len(compare_series) == 0:
+            raise RuntimeError("Nothing to plot: select --method goal/BHKF/both and/or set --mc-samples")
+        methods_str = " + ".join([lbl for (lbl, _, _) in compare_series])
+        plot_compare_component(
+            t_eval,
+            compare_series,
+            title=f"{prob.name}: comparison ({methods_str})",
+            outpath=os.path.join(args.figdir, f"{prob.name}_compare_comp{int(args.compare_comp)}.png"),
+            comp=int(args.compare_comp),
         )
 
     print(f"Saved figures to: {os.path.abspath(args.figdir)}")
