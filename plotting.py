@@ -343,39 +343,47 @@ def plot_mc_w2_distribution_vs_runtime(
 
     positions: list[float] = []
     data: list[np.ndarray] = []
+    kept_Ns: list[int] = []
 
     for N in Ns:
         vals = mc_dist[N]
+        if len(vals) == 0:
+            continue
+
         rts = np.asarray([v[0] for v in vals], dtype=float)
         w2s = np.asarray([v[1] for v in vals], dtype=float)
+
         x = float(np.median(rts) if use_median_runtime else np.mean(rts))
         positions.append(x)
         data.append(w2s)
+        kept_Ns.append(int(N))
 
     positions = np.asarray(positions, dtype=float)
 
-    # --- widths in *data units*; on log-x we choose widths in "decades" to avoid overlap
+    if positions.size == 0:
+        raise ValueError("mc_dist is empty; cannot make runtime comparison plot.")
+
+    # Widths in data units; on log-x choose widths based on local spacing in decades.
     if positions.size == 1:
         widths = np.asarray([0.12 * positions[0]], dtype=float)
     else:
         logpos = np.log10(positions)
         dlog = np.diff(logpos)
-        # nearest-neighbour gaps in log-space (decades)
+
         left_gap = np.r_[np.inf, dlog]
         right_gap = np.r_[dlog, np.inf]
         min_gap = np.minimum(left_gap, right_gap)
-        # take a fraction of the local gap (cap to keep boxes slim)
+
         w_dec = np.clip(0.35 * min_gap, 0.015, 0.06)
         widths = positions * (10.0 ** w_dec - 10.0 ** (-w_dec))
 
     fig, ax = plt.subplots()
 
-    # style-consistent box/median lines
     lw = float(plt.rcParams.get("lines.linewidth", 1.2))
     edge_col = plt.rcParams.get("axes.edgecolor", "0.15")
 
     cycle = plt.rcParams.get("axes.prop_cycle", None)
-    cols = (cycle.by_key().get("color", []) if cycle is not None else [])
+    cols = cycle.by_key().get("color", []) if cycle is not None else []
     median_col = cols[1] if len(cols) >= 2 else "C1"
 
     ax.boxplot(
@@ -390,11 +398,24 @@ def plot_mc_w2_distribution_vs_runtime(
         medianprops={"linewidth": lw, "color": median_col},
     )
 
-    # method markers (legend only)
     if prop_pt is not None:
-        ax.scatter([prop_pt[0]], [prop_pt[1]], marker="X", s=70, label="First-order", zorder=6)
+        ax.scatter(
+            [prop_pt[0]],
+            [prop_pt[1]],
+            marker="x",
+            s=70,
+            label="First-order",
+            zorder=6,
+        )
     if bhkf_pt is not None:
-        ax.scatter([bhkf_pt[0]], [bhkf_pt[1]], marker="x", s=70, label="BHKF", zorder=6)
+        ax.scatter(
+            [bhkf_pt[0]],
+            [bhkf_pt[1]],
+            marker="x",
+            s=70,
+            label="BHKF",
+            zorder=6,
+        )
 
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -402,14 +423,11 @@ def plot_mc_w2_distribution_vs_runtime(
     ax.set_ylabel("W2rms (log)")
     ax.set_title("\n".join(textwrap.wrap(title, width=46)), pad=7)
 
-    # cleaner grid: y-major only (keeps the plot readable at small height)
     ax.grid(True, which="major", axis="y", alpha=0.30)
     ax.grid(False, which="minor", axis="y")
     ax.grid(False, axis="x")
-
     ax.margins(x=0.06)
 
-    # --- top axis with N labels (compact + staggered)
     def _fmt_N(N: int) -> str:
         if N >= 1000 and (N % 1000 == 0):
             return f"{N // 1000}k"
@@ -419,28 +437,20 @@ def plot_mc_w2_distribution_vs_runtime(
     top.set_xscale("log")
     top.set_xlim(ax.get_xlim())
     top.set_xticks(positions)
+    top.set_xticklabels([_fmt_N(N) for N in kept_Ns])
+    top.set_xlabel("Monte Carlo samples", labelpad=6)
 
-    top_labels = []
-    for i, N in enumerate(Ns):
-        lab = f"N={_fmt_N(int(N))}"
-        # stagger labels with a leading newline to reduce collisions
-        if (i % 2) == 1:
-            lab = "\n" + lab
-        top_labels.append(lab)
-
-    top.set_xticklabels(top_labels, rotation=25, ha="left")
-    top.tick_params(
-        axis="x",
-        which="both",
-        length=0,
-        pad=1,
-        labelsize=float(plt.rcParams.get("xtick.labelsize", 8)) * 0.90,
-    )
-
-    # remove top-axis spines for a cleaner look
-    for s in ("left", "right", "bottom", "top"):
-        top.spines[s].set_visible(False)
+    top.xaxis.set_ticks_position("top")
+    top.xaxis.set_label_position("top")
+    top.tick_params(axis="x", which="major", direction="out", pad=3)
+    top.tick_params(axis="x", which="minor", length=0)
+    top.minorticks_off()
     top.grid(False)
+
+    top.spines["top"].set_visible(True)
+    top.spines["bottom"].set_visible(False)
+    top.spines["left"].set_visible(False)
+    top.spines["right"].set_visible(False)
 
     if any(p is not None for p in (prop_pt, bhkf_pt)):
         ax.legend(
@@ -452,7 +462,5 @@ def plot_mc_w2_distribution_vs_runtime(
             labelspacing=0.25,
         )
 
-    # keep only ONE tight_layout call
-    fig.tight_layout(pad=0.25, rect=(0.0, 0.0, 1.0, 0.92))
-
+    fig.tight_layout(pad=0.25, rect=(0.0, 0.0, 1.0, 0.95))
     savefig(fig, outpath)
